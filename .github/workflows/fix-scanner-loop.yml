@@ -1,0 +1,39 @@
+name: Fix scanner loop deadlock
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !contains(github.event.head_commit.message, '[scanner-patch]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch scanner loop
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app.js')
+          s = p.read_text()
+          old = """    lastFrameAt: 0,\n    sampleCounter: 0,"""
+          new = """    lastFrameAt: 0,\n    meshBusy: false,\n    sampleCounter: 0,"""
+          if 'meshBusy: false' not in s:
+              s = s.replace(old, new, 1)
+          start = s.index('  async function processLoop(t) {')
+          end = s.index('\n  function advancePhase()', start)
+          replacement = '''  function processLoop(t) {\n    if (!state.stream || state.analyzing) return;\n\n    // Keep the animation loop alive even while MediaPipe is processing a frame.\n    // The previous async/await structure could stop scheduling requestAnimationFrame\n    // when FaceMesh.send() stalled, which made the scan appear frozen at a turn phase.\n    if (video.readyState >= 2 && state.mesh && !state.meshBusy && t - state.lastFrameAt > 135) {\n      state.lastFrameAt = t;\n      state.meshBusy = true;\n      state.mesh.send({ image: video })\n        .then(() => {\n          if (state.phase !== 'idle' && state.phase !== 'done' && state.lastLandmarks) {\n            state.sampleCounter++;\n            if (state.sampleCounter % 2 === 0) {\n              const m = lmMetrics(state.lastLandmarks);\n              if (directionOkay(m, state.phase) && scaleOkay(m)) {\n                state.frames.push(snapshot(state.phase, state.lastLandmarks));\n              }\n            }\n          }\n        })\n        .catch((e) => console.warn('Face processing error:', e))\n        .finally(() => { state.meshBusy = false; });\n    }\n\n    state.raf = requestAnimationFrame(processLoop);\n  }\n'''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+      - name: Commit scanner patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.js
+          git diff --cached --quiet && exit 0
+          git commit -m "Fix scanner loop deadlock [scanner-patch]"
+          git push
