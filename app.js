@@ -6,6 +6,7 @@
   const video = $('#video');
   const overlay = $('#overlay');
   const octx = overlay?.getContext('2d');
+  const MEDIAPIPE_VERSION = '0.4.1633559619';
 
   const PHASES = {
     front: { title: 'LOOK STRAIGHT', sub: 'Head level, eyes forward, face centered.', card: '#stageFront', minFrames: 6 },
@@ -26,6 +27,7 @@
     phaseIndex: 0,
     phaseStart: 0,
     scanStart: 0,
+    phaseElapsed: 0,
     frames: [],
     lastLandmarks: null,
     lastFrameAt: 0,
@@ -111,7 +113,7 @@
     $('#subGuide').textContent = phase === 'idle' ? 'Your camera never leaves this page.' : phase === 'done' ? 'Checking measurement reliability.' : p.sub;
     $$('.stage-card').forEach((x) => x.classList.remove('active'));
     if (p?.card) $(p.card)?.classList.add('active');
-    const progress = phase === 'done' ? 100 : clamp(((state.phaseIndex * 5000 + phaseElapsed) / 15000) * 100, 0, 100);
+    const progress = phase === 'done' ? 100 : clamp(((state.phaseIndex * PHASE_MS + phaseElapsed) / (PHASE_ORDER.length * PHASE_MAX_MS)) * 100, 0, 100);
     $('#progressBar').style.width = `${progress}%`;
     const seconds = active ? Math.floor(phaseElapsed / 1000) : phase === 'done' ? 15 : 0;
     $('#timer').textContent = `00:${String(seconds).padStart(2, '0')}`;
@@ -156,10 +158,8 @@
   }
 
   function bboxFromLandmarks(lm) {
-    const xs = lm.map((p) => p.x);
-    const ys = lm.map((p) => p.y);
-    const minX = Math.min(...xs), maxX = Math.max(...xs);
-    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    const xs = lm.map((p) => p.x), ys = lm.map((p) => p.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
     return { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY, area: (maxX - minX) * (maxY - minY) };
   }
 
@@ -171,53 +171,39 @@
 
   function lmMetrics(lm) {
     const p = (i) => lm[i];
-    const eyeL = p(33), eyeR = p(263);
-    const innerL = p(133), innerR = p(362);
-    const outerL = p(130), outerR = p(359);
-    const browL = p(105), browR = p(334);
-    const nose = p(1), noseBridge = p(168);
-    const chin = p(152), forehead = p(10);
-    const cheekL = p(234), cheekR = p(454);
-    const jawL = p(172), jawR = p(397);
-    const mouthL = p(61), mouthR = p(291);
-    const mouthTop = p(13), mouthBottom = p(14);
+    const eyeL = p(33), eyeR = p(263), innerL = p(133), innerR = p(362);
+    const outerL = p(130), outerR = p(359), browL = p(105), browR = p(334);
+    const nose = p(1), noseBridge = p(168), chin = p(152), forehead = p(10);
+    const cheekL = p(234), cheekR = p(454), jawL = p(172), jawR = p(397);
+    const mouthL = p(61), mouthR = p(291), mouthTop = p(13), mouthBottom = p(14);
     const eyeMid = { x: (eyeL.x + eyeR.x) / 2, y: (eyeL.y + eyeR.y) / 2 };
     const eyeDist = Math.max(0.001, dist(eyeL, eyeR));
     const faceWidth = Math.max(0.001, dist(cheekL, cheekR));
     const faceHeight = Math.max(0.001, dist(forehead, chin));
     const roll = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x);
     const rot = (q) => rotatePoint(q, eyeMid, -roll);
-
     const rEyeL = rot(eyeL), rEyeR = rot(eyeR), rInnerL = rot(innerL), rInnerR = rot(innerR);
     const rBrowL = rot(browL), rBrowR = rot(browR), rMouthL = rot(mouthL), rMouthR = rot(mouthR);
-    const rJawL = rot(jawL), rJawR = rot(jawR), rCheekL = rot(cheekL), rCheekR = rot(cheekR);
+    const rJawL = rot(jawL), rJawR = rot(jawR);
     const rEyeMid = { x: (rEyeL.x + rEyeR.x) / 2, y: (rEyeL.y + rEyeR.y) / 2 };
-
-    let symmetryError = 0;
     const symmetryPairs = [[eyeL, eyeR], [innerL, innerR], [browL, browR], [mouthL, mouthR], [jawL, jawR], [cheekL, cheekR], [p(145), p(374)], [p(159), p(386)]];
+    let symmetryError = 0;
     for (const [a, b] of symmetryPairs) {
       const ra = rot(a), rb = rot(b);
       symmetryError += Math.hypot((2 * rEyeMid.x - ra.x) - rb.x, ra.y - rb.y) / faceWidth;
     }
     const symmetry = clamp(1 - (symmetryError / symmetryPairs.length) / 0.18, 0, 1);
-
     const bbox = bboxFromLandmarks(lm);
-    const pitchProxy = ((nose.y - eyeMid.y) / faceHeight);
+    const pitchProxy = (nose.y - eyeMid.y) / faceHeight;
     const faceCenterOffset = Math.abs(nose.x - eyeMid.x) / faceWidth;
     const yaw = (nose.x - eyeMid.x) / eyeDist;
-
     return {
       eyeDist, faceWidth, faceHeight,
-      jawWidth: dist(rJawL, rJawR),
-      mouthWidth: dist(rMouthL, rMouthR),
-      eyeSpacing: dist(rInnerL, rInnerR),
+      jawWidth: dist(rJawL, rJawR), mouthWidth: dist(rMouthL, rMouthR), eyeSpacing: dist(rInnerL, rInnerR),
       eyeWidth: avg([dist(rInnerL, rot(outerL)), dist(rInnerR, rot(outerR))]),
       browEyeGap: avg([dist(rBrowL, rot(p(159))), dist(rBrowR, rot(p(386)))]),
-      noseLength: dist(rot(noseBridge), rot(nose)),
-      lipHeight: dist(rot(mouthTop), rot(mouthBottom)),
-      yaw, roll, pitchProxy, faceCenterOffset,
-      symmetry,
-      bbox,
+      noseLength: dist(rot(noseBridge), rot(nose)), lipHeight: dist(rot(mouthTop), rot(mouthBottom)),
+      yaw, roll, pitchProxy, faceCenterOffset, symmetry, bbox,
       faceRatio: faceWidth / faceHeight,
       jawRatio: dist(rJawL, rJawR) / faceWidth,
       eyeSpacingRatio: dist(rInnerL, rInnerR) / faceWidth,
@@ -231,19 +217,15 @@
   }
 
   function poseScore(m, phase) {
-    const yaw = Math.abs(m.yaw);
-    const roll = Math.abs(m.roll);
+    const yaw = Math.abs(m.yaw), roll = Math.abs(m.roll);
     const rollPart = clamp(1 - roll / 0.13, 0, 1);
-    const scale = m.bbox?.width || 0;
-    const scalePart = clamp(1 - Math.abs(scale - 0.50) / 0.34, 0, 1);
-    if (phase === 'front') {
-      return 0.62 * clamp(1 - yaw / 0.14, 0, 1) + 0.23 * rollPart + 0.15 * scalePart;
-    }
+    const scalePart = clamp(1 - Math.abs((m.bbox?.width || 0) - 0.50) / 0.34, 0, 1);
+    if (phase === 'front') return 0.62 * clamp(1 - yaw / 0.14, 0, 1) + 0.23 * rollPart + 0.15 * scalePart;
     return 0.67 * clamp((yaw - 0.15) / 0.22, 0, 1) + 0.20 * rollPart + 0.13 * scalePart;
   }
 
   function directionOkay(m, phase) {
-    if (phase === 'front') return Math.abs(m.yaw) < 0.13 && Math.abs(m.roll) < 0.12;
+    if (phase === 'front') return Math.abs(m.yaw) < 0.13 && Math.abs(m.roll) < 0.12 && Math.abs(m.pitchProxy - 0.31) < 0.10;
     if (phase === 'left') return m.yaw > 0.15 && m.yaw < 0.55 && Math.abs(m.roll) < 0.14;
     if (phase === 'right') return m.yaw < -0.15 && m.yaw > -0.55 && Math.abs(m.roll) < 0.14;
     return false;
@@ -263,17 +245,17 @@
     const rh = clamp(Math.floor(b.height * h) + padY * 2, 1, h - y);
     const image = ctx.getImageData(x, y, rw, rh);
     const exposure = meanLuma(image);
-    const sharp = sharpnessScore({ getImageData: () => image }, rw, rh);
+    const roiCtx = { getImageData: () => image };
+    const sharp = sharpnessScore(roiCtx, rw, rh);
     const light = clamp(1 - Math.abs(exposure.luma - 128) / 128, 0, 1) * clamp(1 - exposure.clipped * 4, 0, 1);
-    return { sharp, light, bbox: b };
+    return { sharp, light };
   }
 
   function snapshot(phase, lm) {
     const c = document.createElement('canvas');
     const w = 360;
     const h = Math.max(220, Math.min(480, Math.round(video.videoHeight / Math.max(1, video.videoWidth) * w)));
-    c.width = w;
-    c.height = h;
+    c.width = w; c.height = h;
     const ctx = c.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(video, 0, 0, w, h);
     const m = lmMetrics(lm);
@@ -285,34 +267,10 @@
     return { phase, quality, sharp: roi.sharp, light: roi.light, pose, centered, scale, metrics: m, time: Date.now() };
   }
 
-  function drawLandmarks(lm, phase) {
-    if (!octx || !video) return;
-    const r = video.getBoundingClientRect();
-    octx.clearRect(0, 0, r.width, r.height);
-    if (!lm) return;
-    octx.lineWidth = 1.4;
-    octx.strokeStyle = 'rgba(215,255,79,.72)';
-    [10, 152, 33, 263, 234, 454, 172, 397, 1, 61, 291].forEach((i) => {
-      const pt = lm[i];
-      if (!pt) return;
-      octx.beginPath();
-      octx.arc(pt.x * r.width, pt.y * r.height, 2.2, 0, Math.PI * 2);
-      octx.stroke();
-    });
-    const m = lmMetrics(lm);
-    const cx = ((lm[234].x + lm[454].x) / 2) * r.width;
-    const cy = ((lm[10].y + lm[152].y) / 2) * r.height;
-    const good = directionOkay(m, phase) && scaleOkay(m);
-    octx.strokeStyle = good ? 'rgba(215,255,79,.78)' : 'rgba(255,200,87,.72)';
-    octx.beginPath();
-    octx.arc(cx, cy, Math.max(25, m.faceWidth * r.width * 0.38), 0, Math.PI * 2);
-    octx.stroke();
-  }
-
   async function ensureMesh() {
     if (state.mesh) return state.mesh;
     if (typeof FaceMesh === 'undefined') throw new Error('The face-landmark engine could not load. Check your connection and refresh.');
-    state.mesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+    state.mesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@${MEDIAPIPE_VERSION}/${file}` });
     state.mesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.70, minTrackingConfidence: 0.70 });
     state.mesh.onResults((results) => {
       if (!results.multiFaceLandmarks?.length) {
@@ -352,7 +310,7 @@
 
   function advancePhase() {
     if (state.phaseIndex >= PHASE_ORDER.length - 1) {
-      setScanUI('done', state.phaseElapsed || PHASE_MS);
+      setScanUI('done', state.phaseElapsed);
       state.analyzing = true;
       cancelAnimationFrame(state.raf);
       state.scanRaf = setTimeout(finishAnalysis, 650);
@@ -371,35 +329,18 @@
     const phase = PHASE_ORDER[state.phaseIndex];
     const count = state.frames.filter((f) => f.phase === phase).length;
     setScanUI(phase, elapsed);
-
-    if (elapsed >= PHASE_MS && count >= PHASES[phase].minFrames) {
-      advancePhase();
-      return;
-    }
-    if (elapsed >= PHASE_MAX_MS) {
-      advancePhase();
-      return;
-    }
+    if (elapsed >= PHASE_MS && count >= PHASES[phase].minFrames) { advancePhase(); return; }
+    if (elapsed >= PHASE_MAX_MS) { advancePhase(); return; }
     state.scanRaf = requestAnimationFrame(scanTick);
   }
 
   async function enableCamera() {
-    if (!state.profile) {
-      toast('Choose a rating profile first.');
-      $('#setup')?.scrollIntoView({ behavior: 'smooth' });
-      return;
-    }
-    if (!navigator.mediaDevices?.getUserMedia) {
-      toast('Camera access is unavailable here. Use HTTPS or localhost.');
-      return;
-    }
+    if (!state.profile) { toast('Choose a rating profile first.'); $('#setup')?.scrollIntoView({ behavior: 'smooth' }); return; }
+    if (!navigator.mediaDevices?.getUserMedia) { toast('Camera access is unavailable here. Use HTTPS or localhost.'); return; }
     try {
       await ensureMesh();
       if (state.stream) stopCamera(false);
-      state.stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: { ideal: 'user' }, width: { ideal: 720 }, height: { ideal: 1280 }, frameRate: { ideal: 30, max: 30 } }
-      });
+      state.stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'user' }, width: { ideal: 720 }, height: { ideal: 1280 }, frameRate: { ideal: 30, max: 30 } } });
       video.srcObject = state.stream;
       await video.play();
       resizeOverlay();
@@ -421,9 +362,7 @@
       state.scanRaf = requestAnimationFrame(scanTick);
     } catch (err) {
       console.error(err);
-      $('#cameraStatus').textContent = err.name === 'NotAllowedError'
-        ? 'Camera permission was denied. Allow camera access and try again.'
-        : 'Camera could not start. Use HTTPS or localhost and make sure another app is not using the camera.';
+      $('#cameraStatus').textContent = err.name === 'NotAllowedError' ? 'Camera permission was denied. Allow camera access and try again.' : 'Camera could not start. Use HTTPS or localhost and make sure another app is not using the camera.';
       toast('Camera could not be started.');
       $('#cameraBtn').disabled = false;
     }
@@ -441,11 +380,7 @@
     $('#cameraBtn').textContent = 'Enable Camera';
     $('#cameraBtn').disabled = false;
     $('#stopBtn').disabled = true;
-    if (showMessage) {
-      $('#cameraStatus').textContent = 'Scan stopped. Your camera is off.';
-      setScanUI('idle', 0);
-      drawLandmarks(null, 'idle');
-    }
+    if (showMessage) { $('#cameraStatus').textContent = 'Scan stopped. Your camera is off.'; setScanUI('idle', 0); drawLandmarks(null, 'idle'); }
   }
 
   function chooseDiverse(frames, count) {
@@ -453,12 +388,8 @@
     const pool = frames.slice().sort((a, b) => b.quality - a.quality).slice(0, Math.min(24, frames.length));
     const chosen = [];
     while (pool.length && chosen.length < count) {
-      if (!chosen.length) {
-        chosen.push(pool.shift());
-        continue;
-      }
-      let index = 0;
-      let best = -Infinity;
+      if (!chosen.length) { chosen.push(pool.shift()); continue; }
+      let index = 0, best = -Infinity;
       for (let i = 0; i < pool.length; i++) {
         const candidate = pool[i];
         const timeSpread = chosen.reduce((sum, c) => sum + Math.min(1, Math.abs(candidate.time - c.time) / 1200), 0);
@@ -471,17 +402,28 @@
     return chosen;
   }
 
+  function robustMedian(values) {
+    const v = values.filter(Number.isFinite);
+    if (v.length < 4) return median(v);
+    const med = median(v);
+    const deviations = v.map((x) => Math.abs(x - med));
+    const mad = median(deviations);
+    if (mad < 1e-6) return med;
+    const filtered = v.filter((x) => Math.abs(x - med) <= 3 * 1.4826 * mad);
+    return median(filtered.length >= 3 ? filtered : v);
+  }
+
   function aggregateRobust(frames) {
     if (!frames.length) return null;
     const keys = Object.keys(frames[0].metrics);
     const m = {};
-    for (const key of keys) m[key] = median(frames.map((f) => f.metrics[key]));
-    m.quality = median(frames.map((f) => f.quality));
-    m.sharp = median(frames.map((f) => f.sharp));
-    m.light = median(frames.map((f) => f.light));
-    m.pose = median(frames.map((f) => f.pose));
-    m.centered = median(frames.map((f) => f.centered));
-    m.scale = median(frames.map((f) => f.scale));
+    for (const key of keys) m[key] = robustMedian(frames.map((f) => f.metrics[key]));
+    m.quality = robustMedian(frames.map((f) => f.quality));
+    m.sharp = robustMedian(frames.map((f) => f.sharp));
+    m.light = robustMedian(frames.map((f) => f.light));
+    m.pose = robustMedian(frames.map((f) => f.pose));
+    m.centered = robustMedian(frames.map((f) => f.centered));
+    m.scale = robustMedian(frames.map((f) => f.scale));
     return m;
   }
 
@@ -507,8 +449,7 @@
 
   function profileSupport(left, right) {
     const sides = [left, right].filter(Boolean);
-    if (!sides.length) return { coverage: 0, profileEvidence: 0.35, consistency: 0.35 };
-    const evidence = median(sides.map((s) => clamp((Math.abs(s.yaw) - 0.15) / 0.25, 0, 1)));
+    if (!sides.length) return { coverage: 0, consistency: 0.35 };
     const consistency = sides.length === 2
       ? clamp(1 - avg([
         Math.abs(left.jawRatio - right.jawRatio) / 0.18,
@@ -516,83 +457,46 @@
         Math.abs(left.noseRatio - right.noseRatio) / 0.14
       ]), 0, 1)
       : 0.5;
-    return { coverage: sides.length === 2 ? 1 : 0.65, profileEvidence: evidence, consistency };
+    return { coverage: sides.length === 2 ? 1 : 0.65, consistency };
   }
 
   function measurementStability(frontFrames) {
     if (frontFrames.length < 3) return 0.25;
     const keys = ['faceRatio', 'jawRatio', 'eyeSpacingRatio', 'noseRatio', 'mouthRatio', 'symmetry', 'lowerFaceRatio'];
-    const scores = keys.map((key) => {
+    return avg(keys.map((key) => {
       const values = frontFrames.map((f) => f.metrics[key]);
       const med = Math.max(0.02, Math.abs(median(values)));
-      const relative = stdev(values) / med;
-      return clamp(1 - relative / 0.10, 0, 1);
-    });
-    return avg(scores);
+      return clamp(1 - (stdev(values) / med) / 0.10, 0, 1);
+    }));
   }
 
   function appearanceScore(front, left, right, frontFrames, selectedFrames) {
     if (!front) return { score: 0, components: {}, reliability: 0 };
     const f = frontFeatureScores(front);
     const p = profileSupport(left, right);
-    const components = {
-      symmetry: f.symmetry,
-      faceHarmony: f.faceHarmony,
-      jawBalance: f.jawBalance,
-      eyeSpacing: f.eyeSpacing,
-      noseProportion: f.noseProportion,
-      mouthProportion: f.mouthProportion,
-      browBalance: f.browBalance,
-      lowerFace: f.lowerFace
-    };
-
-    // Transparent heuristic weights. These are not a scientifically calibrated PSL model.
-    // Image quality and pose quality are deliberately excluded from attractiveness points.
+    const components = { symmetry: f.symmetry, faceHarmony: f.faceHarmony, jawBalance: f.jawBalance, eyeSpacing: f.eyeSpacing, noseProportion: f.noseProportion, mouthProportion: f.mouthProportion, browBalance: f.browBalance, lowerFace: f.lowerFace };
     const weights = state.profile === 'man'
       ? { symmetry: 0.15, faceHarmony: 0.14, jawBalance: 0.16, eyeSpacing: 0.09, noseProportion: 0.09, mouthProportion: 0.06, browBalance: 0.06, lowerFace: 0.12 }
       : state.profile === 'woman'
         ? { symmetry: 0.15, faceHarmony: 0.15, jawBalance: 0.10, eyeSpacing: 0.12, noseProportion: 0.10, mouthProportion: 0.09, browBalance: 0.08, lowerFace: 0.11 }
         : { symmetry: 0.15, faceHarmony: 0.14, jawBalance: 0.13, eyeSpacing: 0.10, noseProportion: 0.09, mouthProportion: 0.08, browBalance: 0.07, lowerFace: 0.12 };
-
     let weighted = 0, weight = 0;
     for (const [key, w] of Object.entries(weights)) { weighted += components[key] * w; weight += w; }
     const normalized = clamp(weighted / Math.max(0.001, weight), 0, 1);
     const score = Number((normalized * 8).toFixed(1));
-
     const stability = measurementStability(frontFrames);
     const poseQuality = median(selectedFrames.map((x) => x.pose));
     const imageQuality = median(selectedFrames.map((x) => avg([x.sharp, x.light, x.centered, x.scale])));
     const coverage = p.coverage;
     const countQuality = clamp(frontFrames.length / 10, 0, 1);
-    const reliability = Math.round(clamp(
-      30 + 30 * stability + 18 * poseQuality + 12 * imageQuality * countQuality + 10 * coverage,
-      30,
-      96
-    ));
-
+    const reliability = Math.round(clamp(30 + 30 * stability + 18 * poseQuality + 12 * imageQuality * countQuality + 10 * coverage, 30, 96));
     return { score, components, reliability, normalized, stability, profileCoverage: coverage, profileConsistency: p.consistency };
   }
 
   function tier(score, profile) {
-    if (profile === 'man') {
-      if (score < 3.5) return 'LTN';
-      if (score < 4.8) return 'MTN';
-      if (score < 6.1) return 'HTN';
-      if (score < 7.15) return 'HIGH TIER';
-      return 'TOP TIER';
-    }
-    if (profile === 'woman') {
-      if (score < 3.5) return 'SUB-5';
-      if (score < 4.8) return 'LTB';
-      if (score < 6.1) return 'MTB';
-      if (score < 7.15) return 'HTB';
-      return 'TOP TIER';
-    }
-    if (score < 3.5) return 'LOW';
-    if (score < 4.8) return 'MID';
-    if (score < 6.1) return 'HIGH';
-    if (score < 7.15) return 'VERY HIGH';
-    return 'TOP';
+    if (profile === 'man') { if (score < 3.5) return 'LTN'; if (score < 4.8) return 'MTN'; if (score < 6.1) return 'HTN'; if (score < 7.15) return 'HIGH TIER'; return 'TOP TIER'; }
+    if (profile === 'woman') { if (score < 3.5) return 'SUB-5'; if (score < 4.8) return 'LTB'; if (score < 6.1) return 'MTB'; if (score < 7.15) return 'HTB'; return 'TOP TIER'; }
+    if (score < 3.5) return 'LOW'; if (score < 4.8) return 'MID'; if (score < 6.1) return 'HIGH'; if (score < 7.15) return 'VERY HIGH'; return 'TOP';
   }
 
   const level = (v, good, mid, bad) => v > 0.67 ? good : v > 0.42 ? mid : bad;
@@ -605,8 +509,7 @@
     $('#outProfile').textContent = state.profile.toUpperCase();
     $('#outFrames').textContent = `${selectedFrames.length} stable frames • ${[front, left, right].filter(Boolean).length} angle groups`;
     $('#confidence').textContent = `${reliability}% analysis reliability`;
-    $('#scoreText').textContent = 'Looksmaxx heuristic estimate from normalized facial geometry. Camera quality, pose and lighting affect reliability rather than adding attractiveness points. This is not a scientifically calibrated attractiveness measurement.';
-
+    $('#scoreText').textContent = 'Looksmaxx heuristic estimate from normalized facial geometry. Camera quality, pose and lighting affect reliability rather than attractiveness points. This is not a scientifically calibrated attractiveness measurement.';
     const traits = [
       ['Face shape', front.faceRatio < 0.66 ? 'Long / oval leaning' : front.faceRatio > 0.80 ? 'Wider / rounder leaning' : 'Balanced oval leaning', 'Width-to-height landmark ratio.'],
       ['Facial symmetry', level(components.symmetry, 'High landmark balance', 'Generally balanced', 'More asymmetry visible'), 'Multiple mirrored landmark pairs after roll normalization.'],
@@ -616,62 +519,42 @@
       ['Mouth proportion', level(components.mouthProportion, 'Balanced', 'Moderate', 'Further from reference range'), 'Mouth width relative to facial width.'],
       ['Brow balance', level(components.browBalance, 'Balanced', 'Moderate', 'Further from reference range'), 'Brow-to-eye spacing proxy.'],
       ['Lower face', level(components.lowerFace, 'Balanced', 'Moderate', 'Further from reference range'), 'Nose-to-chin relationship in frontal geometry.'],
-      ['Profile evidence', left && right ? 'Both sides captured' : left || right ? 'Partial side evidence' : 'No stable side evidence', 'Used as supporting evidence and consistency checking; not a rotation bonus.']
+      ['Profile evidence', left && right ? 'Both sides captured' : left || right ? 'Partial side evidence' : 'No stable side evidence', 'Side coverage is supporting evidence, not a rotation bonus.']
     ];
     $('#traitList').innerHTML = traits.map(([a, b, c]) => `<div class="trait"><b>${a}</b><span>${b} — ${c}</span></div>`).join('');
-
     const metrics = [
-      ['Face width / height', front.faceRatio, 0.9],
-      ['Jaw / cheek width', front.jawRatio, 0.9],
-      ['Eye spacing / face width', front.eyeSpacingRatio, 0.7],
-      ['Nose / face height', front.noseRatio, 0.5],
-      ['Mouth / face width', front.mouthRatio, 0.7],
-      ['Symmetry indicator', front.symmetry, 1]
+      ['Face width / height', front.faceRatio, 0.9], ['Jaw / cheek width', front.jawRatio, 0.9], ['Eye spacing / face width', front.eyeSpacingRatio, 0.7],
+      ['Eye width / face width', front.eyeWidthRatio, 0.35], ['Nose / face height', front.noseRatio, 0.5], ['Mouth / face width', front.mouthRatio, 0.7],
+      ['Lip height / face height', front.lipRatio, 0.22], ['Brow-eye gap / face height', front.browEyeGap / Math.max(0.001, front.faceHeight), 0.13], ['Symmetry indicator', front.symmetry, 1]
     ];
     $('#metricGrid').innerHTML = metrics.map(([n, v, max]) => `<div class="metric"><div class="metric-top"><b>${n}</b><small>${round1(v)}</small></div><div class="bar"><i style="width:${pct((v / max) * 100)}"></i></div></div>`).join('');
-
     const improve = [];
-    if (reliability < 70) improve.push(['S', 'Rescan for reliability', 'Keep the phone about 50–70 cm away, at eye level, with your whole face visible and steady.']);
+    if (reliability < 70) improve.push(['S', 'Rescan for reliability', 'Keep the phone about 50–70 cm away, at eye level, with the whole face visible and steady.']);
     if (front.light < 0.64) improve.push(['L', 'Lighting', 'Use broad, even light from in front. Avoid strong side shadows and backlighting.']);
     if (front.sharp < 0.55) improve.push(['F', 'Sharpness', 'Clean the lens, hold steady, and avoid digital zoom.']);
     if (front.jawRatio < 0.56) improve.push(['J', 'Jaw presentation', 'Keep the neck neutral and use consistent three-quarter photography when checking the lower face.']);
     if (components.symmetry < 0.60) improve.push(['A', 'Camera alignment', 'Keep the head level and centered. Perspective and head roll can exaggerate apparent asymmetry.']);
-    if (!improve.length) improve.push(['R', 'Baseline', 'The scan is internally consistent. Focus on grooming, hairstyle, skin care, sleep, posture and presentation rather than chasing tiny score changes.']);
+    if (!improve.length) improve.push(['R', 'Baseline', 'The scan is internally consistent. Focus on grooming, hairstyle, sleep, skin care and presentation rather than chasing tiny score changes.']);
     $('#improvementList').innerHTML = improve.map(([a, b, c]) => `<div class="improvement"><span>${a}</span><div><b>${b}</b><p>${c}</p></div></div>`).join('');
     $('#resultsSection')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   function finishAnalysis() {
     stopCamera(false);
-
     const frontFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'front'), 8);
     const leftFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'left'), 6);
     const rightFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'right'), 6);
-    const front = aggregateRobust(frontFrames);
-    const left = aggregateRobust(leftFrames);
-    const right = aggregateRobust(rightFrames);
+    const front = aggregateRobust(frontFrames), left = aggregateRobust(leftFrames), right = aggregateRobust(rightFrames);
     const selectedFrames = [...frontFrames, ...leftFrames, ...rightFrames];
-
     if (!front || frontFrames.length < PHASES.front.minFrames) {
-      $('#cameraStatus').textContent = 'Not enough stable frontal frames were captured. Rescan with your face centered and head level.';
+      $('#cameraStatus').textContent = 'Not enough stable frontal frames were captured. Rescan with your face centered, level and a comfortable distance from the camera.';
       toast('Not enough stable front frames.');
       state.analyzing = false;
       $('#cameraBtn').disabled = false;
       return;
     }
-
     const result = appearanceScore(front, left, right, frontFrames, selectedFrames);
-    state.lastResult = {
-      score: result.score,
-      tier: tier(result.score, state.profile),
-      profile: state.profile,
-      reliability: result.reliability,
-      frames: selectedFrames.length,
-      timestamp: new Date().toISOString(),
-      front,
-      left,
-      right
-    };
+    state.lastResult = { score: result.score, tier: tier(result.score, state.profile), profile: state.profile, reliability: result.reliability, frames: selectedFrames.length, timestamp: new Date().toISOString(), front, left, right };
     renderResults(result, front, left, right, selectedFrames);
     loadHistory();
     state.analyzing = false;
@@ -684,19 +567,14 @@
   }
 
   function saveResult() {
-    if (!state.lastResult) {
-      toast('Complete a scan first.');
-      return;
-    }
+    if (!state.lastResult) { toast('Complete a scan first.'); return; }
     try {
       const history = safeHistoryRead();
       history.unshift(state.lastResult);
       localStorage.setItem('looksmaxx-history', JSON.stringify(history.slice(0, 15)));
       loadHistory();
       toast('Result saved locally.');
-    } catch {
-      toast('Could not save this result on this device.');
-    }
+    } catch { toast('Could not save this result on this device.'); }
   }
 
   function loadHistory() {
@@ -706,39 +584,20 @@
     $('#historyModalBody').innerHTML = html;
   }
 
-  function clearHistory() {
-    localStorage.removeItem('looksmaxx-history');
-    loadHistory();
-    toast('History cleared.');
-  }
+  function clearHistory() { localStorage.removeItem('looksmaxx-history'); loadHistory(); toast('History cleared.'); }
 
   function clearResult() {
     state.lastResult = null;
-    $('#score').textContent = '—';
-    $('#tier').textContent = 'WAITING';
-    $('#meter').style.width = '0%';
-    $('#outProfile').textContent = '—';
-    $('#outFrames').textContent = '—';
-    $('#confidence').textContent = '—';
-    $('#traitList').innerHTML = '';
-    $('#metricGrid').innerHTML = '';
-    $('#improvementList').innerHTML = '';
-    $('#scoreText').textContent = 'Complete the scan to generate a structured estimate.';
+    $('#score').textContent = '—'; $('#tier').textContent = 'WAITING'; $('#meter').style.width = '0%'; $('#outProfile').textContent = '—'; $('#outFrames').textContent = '—'; $('#confidence').textContent = '—';
+    $('#traitList').innerHTML = ''; $('#metricGrid').innerHTML = ''; $('#improvementList').innerHTML = ''; $('#scoreText').textContent = 'Complete the scan to generate a structured estimate.';
   }
 
   function bindEvents() {
     $$('.profile-card').forEach((b) => b.addEventListener('click', () => setProfile(b.dataset.profile)));
-    $('#heroStart')?.addEventListener('click', () => {
-      $('#setup')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      if (state.profile) setTimeout(scrollToScanner, 250);
-    });
+    $('#heroStart')?.addEventListener('click', () => { $('#setup')?.scrollIntoView({ behavior: 'smooth', block: 'start' }); if (state.profile) setTimeout(scrollToScanner, 250); });
     $('#cameraBtn')?.addEventListener('click', enableCamera);
     $('#stopBtn')?.addEventListener('click', () => stopCamera(true));
-    $('#rescanBtn')?.addEventListener('click', () => {
-      clearResult();
-      scrollToScanner();
-      setTimeout(enableCamera, 350);
-    });
+    $('#rescanBtn')?.addEventListener('click', () => { clearResult(); scrollToScanner(); setTimeout(enableCamera, 350); });
     $('#saveBtn')?.addEventListener('click', saveResult);
     $('#clearBtn')?.addEventListener('click', clearResult);
     $('#clearHistory')?.addEventListener('click', clearHistory);
@@ -751,12 +610,6 @@
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModals(); });
   }
 
-  function bootstrap() {
-    if (state.profile) setProfile(state.profile);
-    loadHistory();
-    bindEvents();
-    resizeOverlay();
-  }
-
+  function bootstrap() { if (state.profile) setProfile(state.profile); loadHistory(); bindEvents(); resizeOverlay(); }
   bootstrap();
 })();
