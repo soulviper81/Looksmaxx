@@ -1,7 +1,12 @@
 # Looksmaxx
 
-Clean rebuild of the Looksmaxx web app.
+Mobile-first browser face-scan lab.
 
-Development branch: `rebuild-v1`.
+## Current build
+The `main` branch contains the active rebuild. It uses the device camera and browser-side facial landmarks to guide a 15-second front/left/right scan, select strong frames, calculate a heuristic appearance estimate, and generate visible facial-trait and improvement guidance.
 
-No Netlify deployment is configured by this repository setup yet.
+## Privacy
+Camera frames are processed in the browser by default and are not uploaded by this project. Saved results use local browser storage.
+
+## Development
+Camera access requires a secure context such as HTTPS or `localhost`; a plain `file://` page cannot access the camera in normal browser security settings.
