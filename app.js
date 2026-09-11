@@ -31,6 +31,7 @@
     frames: [],
     lastLandmarks: null,
     lastFrameAt: 0,
+    meshBusy: false,
     sampleCounter: 0,
     analyzing: false,
     lastResult: null,
@@ -288,23 +289,31 @@
     return state.mesh;
   }
 
-  async function processLoop(t) {
+  function processLoop(t) {
     if (!state.stream || state.analyzing) return;
-    if (video.readyState >= 2 && state.mesh && t - state.lastFrameAt > 115) {
+
+    // Keep the animation loop alive even while MediaPipe is processing a frame.
+    // The previous async/await structure could stop scheduling requestAnimationFrame
+    // when FaceMesh.send() stalled, which made the scan appear frozen at a turn phase.
+    if (video.readyState >= 2 && state.mesh && !state.meshBusy && t - state.lastFrameAt > 135) {
       state.lastFrameAt = t;
-      try {
-        await state.mesh.send({ image: video });
-        if (state.phase !== 'idle' && state.phase !== 'done' && state.lastLandmarks) {
-          state.sampleCounter++;
-          if (state.sampleCounter % 2 === 0) {
-            const m = lmMetrics(state.lastLandmarks);
-            if (directionOkay(m, state.phase) && scaleOkay(m)) state.frames.push(snapshot(state.phase, state.lastLandmarks));
+      state.meshBusy = true;
+      state.mesh.send({ image: video })
+        .then(() => {
+          if (state.phase !== 'idle' && state.phase !== 'done' && state.lastLandmarks) {
+            state.sampleCounter++;
+            if (state.sampleCounter % 2 === 0) {
+              const m = lmMetrics(state.lastLandmarks);
+              if (directionOkay(m, state.phase) && scaleOkay(m)) {
+                state.frames.push(snapshot(state.phase, state.lastLandmarks));
+              }
+            }
           }
-        }
-      } catch (e) {
-        console.warn('Face processing error:', e);
-      }
+        })
+        .catch((e) => console.warn('Face processing error:', e))
+        .finally(() => { state.meshBusy = false; });
     }
+
     state.raf = requestAnimationFrame(processLoop);
   }
 
