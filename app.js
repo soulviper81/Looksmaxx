@@ -7,28 +7,32 @@
   const overlay = $('#overlay');
   const octx = overlay?.getContext('2d');
 
+  const PHASES = {
+    front: { title: 'LOOK STRAIGHT', sub: 'Head level, eyes forward, face centered.', card: '#stageFront', minFrames: 6 },
+    left: { title: 'TURN LEFT →', sub: 'Slowly turn left until the side of your face is clearly visible.', card: '#stageLeft', minFrames: 4 },
+    right: { title: '← TURN RIGHT', sub: 'Slowly turn right until the opposite side is clearly visible.', card: '#stageRight', minFrames: 4 }
+  };
+  const PHASE_ORDER = ['front', 'left', 'right'];
+  const PHASE_MS = 5000;
+  const PHASE_MAX_MS = 8000;
+
   const state = {
     profile: localStorage.getItem('looksmaxx-profile') || '',
     stream: null,
     mesh: null,
     raf: 0,
-    timerRaf: 0,
+    scanRaf: 0,
     phase: 'idle',
+    phaseIndex: 0,
+    phaseStart: 0,
+    scanStart: 0,
     frames: [],
     lastLandmarks: null,
     lastFrameAt: 0,
     sampleCounter: 0,
     analyzing: false,
-    scanStart: 0,
-    totalMs: 15000,
-    currentQuality: { face: 0, pose: 0, sharp: 0, light: 0 },
-    lastResult: null
-  };
-
-  const PHASES = {
-    front: { title: 'LOOK STRAIGHT', sub: 'Eyes forward, head level, and keep the oval centered.', card: '#stageFront' },
-    left: { title: 'TURN LEFT →', sub: 'Slowly turn left until a clear side / three-quarter view is visible.', card: '#stageLeft' },
-    right: { title: '← TURN RIGHT', sub: 'Slowly turn right until the opposite side is clearly visible.', card: '#stageRight' }
+    lastResult: null,
+    currentQuality: { face: 0, pose: 0, sharp: 0, light: 0, scale: 0 }
   };
 
   const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
@@ -60,6 +64,18 @@
     toast.t = setTimeout(() => el.classList.remove('on'), 2600);
   }
 
+  function safeHistoryRead() {
+    try {
+      const raw = localStorage.getItem('looksmaxx-history');
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((x) => x && Number.isFinite(Number(x.score)) && x.timestamp) : [];
+    } catch {
+      localStorage.removeItem('looksmaxx-history');
+      return [];
+    }
+  }
+
   function setProfile(profile) {
     state.profile = profile;
     localStorage.setItem('looksmaxx-profile', profile);
@@ -85,20 +101,21 @@
     octx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
   }
 
-  function setScanUI(phase, elapsed = 0) {
+  function setScanUI(phase, phaseElapsed = 0) {
     state.phase = phase;
     const p = PHASES[phase];
     const active = phase !== 'idle' && phase !== 'done';
     $('#scanState').textContent = phase === 'done' ? 'COMPLETE' : active ? 'SCANNING' : 'IDLE';
     $('#phaseLabel').textContent = phase === 'idle' ? 'Camera not started' : phase === 'done' ? 'Scan complete' : p.title;
     $('#guideText').textContent = phase === 'idle' ? 'Choose a profile, then enable camera' : phase === 'done' ? 'Building report…' : p.title;
-    $('#subGuide').textContent = phase === 'idle' ? 'Your camera never leaves this page.' : phase === 'done' ? 'Checking measurement stability.' : p.sub;
+    $('#subGuide').textContent = phase === 'idle' ? 'Your camera never leaves this page.' : phase === 'done' ? 'Checking measurement reliability.' : p.sub;
     $$('.stage-card').forEach((x) => x.classList.remove('active'));
     if (p?.card) $(p.card)?.classList.add('active');
-    $('#progressBar').style.width = `${phase === 'done' ? 100 : clamp((elapsed / state.totalMs) * 100, 0, 100)}%`;
-    const seconds = active ? Math.min(15, Math.floor(elapsed / 1000) + 1) : phase === 'done' ? 15 : 0;
+    const progress = phase === 'done' ? 100 : clamp(((state.phaseIndex * 5000 + phaseElapsed) / 15000) * 100, 0, 100);
+    $('#progressBar').style.width = `${progress}%`;
+    const seconds = active ? Math.floor(phaseElapsed / 1000) : phase === 'done' ? 15 : 0;
     $('#timer').textContent = `00:${String(seconds).padStart(2, '0')}`;
-    $$('.progress-points span').forEach((el, i) => el.classList.toggle('active', active && i === (phase === 'front' ? 0 : phase === 'left' ? 1 : 2)));
+    $$('.progress-points span').forEach((el, i) => el.classList.toggle('active', active && i === state.phaseIndex));
   }
 
   function setQuality(q) {
@@ -111,17 +128,23 @@
 
   function meanLuma(image) {
     const d = image.data;
-    let total = 0, count = 0;
+    let total = 0;
+    let count = 0;
+    let clipped = 0;
     for (let i = 0; i < d.length; i += 20) {
-      total += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+      const r = d[i], g = d[i + 1], b = d[i + 2];
+      total += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+      if (r < 8 && g < 8 && b < 8) clipped++;
+      if (r > 247 && g > 247 && b > 247) clipped++;
       count++;
     }
-    return total / Math.max(1, count);
+    return { luma: total / Math.max(1, count), clipped: clipped / Math.max(1, count) };
   }
 
   function sharpnessScore(ctx, w, h) {
     const d = ctx.getImageData(0, 0, w, h).data;
-    let total = 0, count = 0;
+    let total = 0;
+    let count = 0;
     for (let y = 3; y < h - 3; y += 5) {
       for (let x = 3; x < w - 3; x += 5) {
         const i = (y * w + x) * 4;
@@ -130,6 +153,20 @@
       }
     }
     return clamp(total / Math.max(1, count) / 28, 0, 1);
+  }
+
+  function bboxFromLandmarks(lm) {
+    const xs = lm.map((p) => p.x);
+    const ys = lm.map((p) => p.y);
+    const minX = Math.min(...xs), maxX = Math.max(...xs);
+    const minY = Math.min(...ys), maxY = Math.max(...ys);
+    return { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY, area: (maxX - minX) * (maxY - minY) };
+  }
+
+  function rotatePoint(pt, center, angle) {
+    const c = Math.cos(angle), s = Math.sin(angle);
+    const x = pt.x - center.x, y = pt.y - center.y;
+    return { x: center.x + x * c - y * s, y: center.y + x * s + y * c, z: pt.z };
   }
 
   function lmMetrics(lm) {
@@ -148,52 +185,104 @@
     const eyeDist = Math.max(0.001, dist(eyeL, eyeR));
     const faceWidth = Math.max(0.001, dist(cheekL, cheekR));
     const faceHeight = Math.max(0.001, dist(forehead, chin));
-    const jawWidth = dist(jawL, jawR);
-    const mouthWidth = dist(mouthL, mouthR);
-    const eyeSpacing = dist(innerL, innerR);
-    const eyeWidth = avg([dist(innerL, outerL), dist(innerR, outerR)]);
-    const browEyeGap = avg([dist(browL, p(159)), dist(browR, p(386))]);
-    const noseLength = dist(noseBridge, nose);
-    const lipHeight = dist(mouthTop, mouthBottom);
     const roll = Math.atan2(eyeR.y - eyeL.y, eyeR.x - eyeL.x);
-    const yaw = (nose.x - eyeMid.x) / eyeDist;
-    const faceCenterOffset = Math.abs(nose.x - eyeMid.x) / faceWidth;
+    const rot = (q) => rotatePoint(q, eyeMid, -roll);
 
-    const pairs = [[33, 263], [133, 362], [105, 334], [61, 291], [172, 397], [234, 454], [145, 374], [159, 386]];
+    const rEyeL = rot(eyeL), rEyeR = rot(eyeR), rInnerL = rot(innerL), rInnerR = rot(innerR);
+    const rBrowL = rot(browL), rBrowR = rot(browR), rMouthL = rot(mouthL), rMouthR = rot(mouthR);
+    const rJawL = rot(jawL), rJawR = rot(jawR), rCheekL = rot(cheekL), rCheekR = rot(cheekR);
+    const rEyeMid = { x: (rEyeL.x + rEyeR.x) / 2, y: (rEyeL.y + rEyeR.y) / 2 };
+
     let symmetryError = 0;
-    for (const [a, b] of pairs) {
-      const pa = p(a), pb = p(b);
-      const mirrorX = 2 * eyeMid.x - pa.x;
-      symmetryError += Math.hypot(mirrorX - pb.x, pa.y - pb.y) / faceWidth;
+    const symmetryPairs = [[eyeL, eyeR], [innerL, innerR], [browL, browR], [mouthL, mouthR], [jawL, jawR], [cheekL, cheekR], [p(145), p(374)], [p(159), p(386)]];
+    for (const [a, b] of symmetryPairs) {
+      const ra = rot(a), rb = rot(b);
+      symmetryError += Math.hypot((2 * rEyeMid.x - ra.x) - rb.x, ra.y - rb.y) / faceWidth;
     }
-    const symmetry = clamp(1 - (symmetryError / pairs.length) / 0.18, 0, 1);
+    const symmetry = clamp(1 - (symmetryError / symmetryPairs.length) / 0.18, 0, 1);
+
+    const bbox = bboxFromLandmarks(lm);
+    const pitchProxy = ((nose.y - eyeMid.y) / faceHeight);
+    const faceCenterOffset = Math.abs(nose.x - eyeMid.x) / faceWidth;
+    const yaw = (nose.x - eyeMid.x) / eyeDist;
 
     return {
-      eyeDist, faceWidth, faceHeight, jawWidth, mouthWidth, eyeSpacing, eyeWidth,
-      browEyeGap, noseLength, lipHeight, yaw, roll, faceCenterOffset, symmetry,
+      eyeDist, faceWidth, faceHeight,
+      jawWidth: dist(rJawL, rJawR),
+      mouthWidth: dist(rMouthL, rMouthR),
+      eyeSpacing: dist(rInnerL, rInnerR),
+      eyeWidth: avg([dist(rInnerL, rot(outerL)), dist(rInnerR, rot(outerR))]),
+      browEyeGap: avg([dist(rBrowL, rot(p(159))), dist(rBrowR, rot(p(386)))]),
+      noseLength: dist(rot(noseBridge), rot(nose)),
+      lipHeight: dist(rot(mouthTop), rot(mouthBottom)),
+      yaw, roll, pitchProxy, faceCenterOffset,
+      symmetry,
+      bbox,
       faceRatio: faceWidth / faceHeight,
-      jawRatio: jawWidth / faceWidth,
-      eyeSpacingRatio: eyeSpacing / faceWidth,
-      eyeWidthRatio: eyeWidth / faceWidth,
-      noseRatio: noseLength / faceHeight,
-      mouthRatio: mouthWidth / faceWidth,
-      lipRatio: lipHeight / faceHeight,
-      lowerFaceRatio: dist(nose, chin) / faceHeight
+      jawRatio: dist(rJawL, rJawR) / faceWidth,
+      eyeSpacingRatio: dist(rInnerL, rInnerR) / faceWidth,
+      eyeWidthRatio: avg([dist(rInnerL, rot(outerL)), dist(rInnerR, rot(outerR))]) / faceWidth,
+      noseRatio: dist(rot(noseBridge), rot(nose)) / faceHeight,
+      mouthRatio: dist(rMouthL, rMouthR) / faceWidth,
+      lipRatio: dist(rot(mouthTop), rot(mouthBottom)) / faceHeight,
+      lowerFaceRatio: dist(rot(nose), rot(chin)) / faceHeight,
+      chinNoseDepthProxy: finite(Math.abs((nose.z || 0) - (chin.z || 0)) / faceWidth)
     };
   }
 
   function poseScore(m, phase) {
     const yaw = Math.abs(m.yaw);
     const roll = Math.abs(m.roll);
+    const rollPart = clamp(1 - roll / 0.13, 0, 1);
+    const scale = m.bbox?.width || 0;
+    const scalePart = clamp(1 - Math.abs(scale - 0.50) / 0.34, 0, 1);
     if (phase === 'front') {
-      return 0.72 * clamp(1 - yaw / 0.14, 0, 1) + 0.28 * clamp(1 - roll / 0.11, 0, 1);
+      return 0.62 * clamp(1 - yaw / 0.14, 0, 1) + 0.23 * rollPart + 0.15 * scalePart;
     }
-    return 0.78 * clamp((yaw - 0.15) / 0.22, 0, 1) + 0.22 * clamp(1 - roll / 0.13, 0, 1);
+    return 0.67 * clamp((yaw - 0.15) / 0.22, 0, 1) + 0.20 * rollPart + 0.13 * scalePart;
   }
 
-  function validPose(m, phase) {
+  function directionOkay(m, phase) {
     if (phase === 'front') return Math.abs(m.yaw) < 0.13 && Math.abs(m.roll) < 0.12;
-    return Math.abs(m.yaw) > 0.15 && Math.abs(m.yaw) < 0.55 && Math.abs(m.roll) < 0.14;
+    if (phase === 'left') return m.yaw > 0.15 && m.yaw < 0.55 && Math.abs(m.roll) < 0.14;
+    if (phase === 'right') return m.yaw < -0.15 && m.yaw > -0.55 && Math.abs(m.roll) < 0.14;
+    return false;
+  }
+
+  function scaleOkay(m) {
+    return m.bbox.width >= 0.26 && m.bbox.width <= 0.78 && m.bbox.height >= 0.30;
+  }
+
+  function faceRoiMetrics(lm, ctx, w, h) {
+    const b = bboxFromLandmarks(lm);
+    const padX = Math.max(8, Math.round(b.width * w * 0.18));
+    const padY = Math.max(8, Math.round(b.height * h * 0.18));
+    const x = clamp(Math.floor(b.minX * w) - padX, 0, w - 1);
+    const y = clamp(Math.floor(b.minY * h) - padY, 0, h - 1);
+    const rw = clamp(Math.floor(b.width * w) + padX * 2, 1, w - x);
+    const rh = clamp(Math.floor(b.height * h) + padY * 2, 1, h - y);
+    const image = ctx.getImageData(x, y, rw, rh);
+    const exposure = meanLuma(image);
+    const sharp = sharpnessScore({ getImageData: () => image }, rw, rh);
+    const light = clamp(1 - Math.abs(exposure.luma - 128) / 128, 0, 1) * clamp(1 - exposure.clipped * 4, 0, 1);
+    return { sharp, light, bbox: b };
+  }
+
+  function snapshot(phase, lm) {
+    const c = document.createElement('canvas');
+    const w = 360;
+    const h = Math.max(220, Math.min(480, Math.round(video.videoHeight / Math.max(1, video.videoWidth) * w)));
+    c.width = w;
+    c.height = h;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(video, 0, 0, w, h);
+    const m = lmMetrics(lm);
+    const roi = faceRoiMetrics(lm, ctx, w, h);
+    const pose = poseScore(m, phase);
+    const centered = clamp(1 - m.faceCenterOffset / 0.34, 0, 1);
+    const scale = clamp(1 - Math.abs(m.bbox.width - 0.50) / 0.34, 0, 1);
+    const quality = 0.36 * pose + 0.25 * roi.sharp + 0.18 * roi.light + 0.12 * centered + 0.09 * scale;
+    return { phase, quality, sharp: roi.sharp, light: roi.light, pose, centered, scale, metrics: m, time: Date.now() };
   }
 
   function drawLandmarks(lm, phase) {
@@ -201,10 +290,9 @@
     const r = video.getBoundingClientRect();
     octx.clearRect(0, 0, r.width, r.height);
     if (!lm) return;
-    const key = [10, 152, 33, 263, 234, 454, 172, 397, 1, 61, 291];
     octx.lineWidth = 1.4;
     octx.strokeStyle = 'rgba(215,255,79,.72)';
-    key.forEach((i) => {
+    [10, 152, 33, 263, 234, 454, 172, 397, 1, 61, 291].forEach((i) => {
       const pt = lm[i];
       if (!pt) return;
       octx.beginPath();
@@ -214,37 +302,18 @@
     const m = lmMetrics(lm);
     const cx = ((lm[234].x + lm[454].x) / 2) * r.width;
     const cy = ((lm[10].y + lm[152].y) / 2) * r.height;
-    octx.strokeStyle = phase === 'front' ? 'rgba(100,220,255,.65)' : 'rgba(215,255,79,.7)';
+    const good = directionOkay(m, phase) && scaleOkay(m);
+    octx.strokeStyle = good ? 'rgba(215,255,79,.78)' : 'rgba(255,200,87,.72)';
     octx.beginPath();
     octx.arc(cx, cy, Math.max(25, m.faceWidth * r.width * 0.38), 0, Math.PI * 2);
     octx.stroke();
   }
 
-  function snapshot(phase, lm) {
-    const c = document.createElement('canvas');
-    const w = 320;
-    const h = Math.max(180, Math.min(420, Math.round(video.videoHeight / Math.max(1, video.videoWidth) * w)));
-    c.width = w;
-    c.height = h;
-    const ctx = c.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(video, 0, 0, w, h);
-    const m = lmMetrics(lm);
-    const image = ctx.getImageData(0, 0, w, h);
-    const luma = meanLuma(image);
-    const light = clamp(1 - Math.abs(luma - 128) / 128, 0, 1);
-    const sharp = sharpnessScore(ctx, w, h);
-    const pose = poseScore(m, phase);
-    const face = clamp(m.faceWidth / 0.42, 0, 1);
-    const centered = clamp(1 - m.faceCenterOffset / 0.34, 0, 1);
-    const quality = 0.35 * pose + 0.25 * sharp + 0.18 * light + 0.12 * face + 0.10 * centered;
-    return { phase, sideSign: Math.sign(m.yaw), quality, sharp, light, pose, centered, metrics: m, time: Date.now() };
-  }
-
   async function ensureMesh() {
     if (state.mesh) return state.mesh;
-    if (typeof FaceMesh === 'undefined') throw new Error('The face-landmark engine could not load. Refresh the page and try again.');
+    if (typeof FaceMesh === 'undefined') throw new Error('The face-landmark engine could not load. Check your connection and refresh.');
     state.mesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
-    state.mesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.68, minTrackingConfidence: 0.68 });
+    state.mesh.setOptions({ maxNumFaces: 1, refineLandmarks: true, minDetectionConfidence: 0.70, minTrackingConfidence: 0.70 });
     state.mesh.onResults((results) => {
       if (!results.multiFaceLandmarks?.length) {
         state.lastLandmarks = null;
@@ -263,7 +332,7 @@
 
   async function processLoop(t) {
     if (!state.stream || state.analyzing) return;
-    if (video.readyState >= 2 && state.mesh && t - state.lastFrameAt > 110) {
+    if (video.readyState >= 2 && state.mesh && t - state.lastFrameAt > 115) {
       state.lastFrameAt = t;
       try {
         await state.mesh.send({ image: video });
@@ -271,7 +340,7 @@
           state.sampleCounter++;
           if (state.sampleCounter % 2 === 0) {
             const m = lmMetrics(state.lastLandmarks);
-            if (validPose(m, state.phase)) state.frames.push(snapshot(state.phase, state.lastLandmarks));
+            if (directionOkay(m, state.phase) && scaleOkay(m)) state.frames.push(snapshot(state.phase, state.lastLandmarks));
           }
         }
       } catch (e) {
@@ -279,6 +348,39 @@
       }
     }
     state.raf = requestAnimationFrame(processLoop);
+  }
+
+  function advancePhase() {
+    if (state.phaseIndex >= PHASE_ORDER.length - 1) {
+      setScanUI('done', state.phaseElapsed || PHASE_MS);
+      state.analyzing = true;
+      cancelAnimationFrame(state.raf);
+      state.scanRaf = setTimeout(finishAnalysis, 650);
+      return;
+    }
+    state.phaseIndex++;
+    state.phase = PHASE_ORDER[state.phaseIndex];
+    state.phaseStart = now();
+    setScanUI(state.phase, 0);
+  }
+
+  function scanTick() {
+    if (!state.stream || state.analyzing) return;
+    const elapsed = now() - state.phaseStart;
+    state.phaseElapsed = elapsed;
+    const phase = PHASE_ORDER[state.phaseIndex];
+    const count = state.frames.filter((f) => f.phase === phase).length;
+    setScanUI(phase, elapsed);
+
+    if (elapsed >= PHASE_MS && count >= PHASES[phase].minFrames) {
+      advancePhase();
+      return;
+    }
+    if (elapsed >= PHASE_MAX_MS) {
+      advancePhase();
+      return;
+    }
+    state.scanRaf = requestAnimationFrame(scanTick);
   }
 
   async function enableCamera() {
@@ -296,12 +398,7 @@
       if (state.stream) stopCamera(false);
       state.stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: {
-          facingMode: { ideal: 'user' },
-          width: { ideal: 720 },
-          height: { ideal: 1280 },
-          frameRate: { ideal: 30, max: 30 }
-        }
+        video: { facingMode: { ideal: 'user' }, width: { ideal: 720 }, height: { ideal: 1280 }, frameRate: { ideal: 30, max: 30 } }
       });
       video.srcObject = state.stream;
       await video.play();
@@ -309,16 +406,19 @@
       $('#cameraBtn').textContent = 'Scanning…';
       $('#cameraBtn').disabled = true;
       $('#stopBtn').disabled = false;
-      $('#cameraStatus').textContent = 'Camera active. Only stable frontal and side-pose frames are retained.';
+      $('#cameraStatus').textContent = 'Camera active. Stable face poses are captured; image quality affects reliability, not the score.';
       state.frames = [];
       state.sampleCounter = 0;
       state.lastFrameAt = 0;
+      state.phaseIndex = 0;
+      state.phase = 'front';
+      state.phaseStart = now();
       state.scanStart = now();
       state.analyzing = false;
       state.lastResult = null;
       setScanUI('front', 0);
       state.raf = requestAnimationFrame(processLoop);
-      runTimedScan();
+      state.scanRaf = requestAnimationFrame(scanTick);
     } catch (err) {
       console.error(err);
       $('#cameraStatus').textContent = err.name === 'NotAllowedError'
@@ -329,27 +429,10 @@
     }
   }
 
-  function runTimedScan() {
-    const loop = () => {
-      if (!state.stream) return;
-      const elapsed = now() - state.scanStart;
-      if (elapsed >= state.totalMs) {
-        setScanUI('done', state.totalMs);
-        state.analyzing = true;
-        cancelAnimationFrame(state.raf);
-        state.timerRaf = setTimeout(finishAnalysis, 650);
-        return;
-      }
-      setScanUI(elapsed < 5000 ? 'front' : elapsed < 10000 ? 'left' : 'right', elapsed);
-      state.timerRaf = requestAnimationFrame(loop);
-    };
-    state.timerRaf = requestAnimationFrame(loop);
-  }
-
   function stopCamera(showMessage = true) {
     cancelAnimationFrame(state.raf);
-    cancelAnimationFrame(state.timerRaf);
-    clearTimeout(state.timerRaf);
+    cancelAnimationFrame(state.scanRaf);
+    clearTimeout(state.scanRaf);
     if (state.stream) state.stream.getTracks().forEach((track) => track.stop());
     state.stream = null;
     if (video) video.srcObject = null;
@@ -365,9 +448,27 @@
     }
   }
 
-  function selectBest(frames, count) {
-    const sorted = frames.slice().sort((a, b) => b.quality - a.quality);
-    return sorted.slice(0, Math.min(count, sorted.length));
+  function chooseDiverse(frames, count) {
+    if (!frames.length) return [];
+    const pool = frames.slice().sort((a, b) => b.quality - a.quality).slice(0, Math.min(24, frames.length));
+    const chosen = [];
+    while (pool.length && chosen.length < count) {
+      if (!chosen.length) {
+        chosen.push(pool.shift());
+        continue;
+      }
+      let index = 0;
+      let best = -Infinity;
+      for (let i = 0; i < pool.length; i++) {
+        const candidate = pool[i];
+        const timeSpread = chosen.reduce((sum, c) => sum + Math.min(1, Math.abs(candidate.time - c.time) / 1200), 0);
+        const yawSpread = chosen.reduce((sum, c) => sum + Math.min(1, Math.abs(candidate.metrics.yaw - c.metrics.yaw) / 0.20), 0);
+        const value = candidate.quality + 0.10 * timeSpread + 0.06 * yawSpread;
+        if (value > best) { best = value; index = i; }
+      }
+      chosen.push(pool.splice(index, 1)[0]);
+    }
+    return chosen;
   }
 
   function aggregateRobust(frames) {
@@ -380,6 +481,7 @@
     m.light = median(frames.map((f) => f.light));
     m.pose = median(frames.map((f) => f.pose));
     m.centered = median(frames.map((f) => f.centered));
+    m.scale = median(frames.map((f) => f.scale));
     return m;
   }
 
@@ -390,51 +492,48 @@
     return clamp((high - value) / Math.max(0.001, high - idealHigh), 0, 1);
   }
 
-  function featureScores(front) {
+  function frontFeatureScores(f) {
     return {
-      symmetry: clamp(front.symmetry, 0, 1),
-      faceHarmony: rangeScore(front.faceRatio, 0.57, 0.66, 0.79, 0.96),
-      jawBalance: rangeScore(front.jawRatio, 0.47, 0.56, 0.73, 0.86),
-      eyeSpacing: rangeScore(front.eyeSpacingRatio, 0.25, 0.32, 0.43, 0.55),
-      noseProportion: rangeScore(front.noseRatio, 0.12, 0.19, 0.29, 0.40),
-      mouthProportion: rangeScore(front.mouthRatio, 0.22, 0.31, 0.47, 0.62),
-      browBalance: rangeScore(front.browEyeGap / Math.max(0.001, front.faceHeight), 0.015, 0.035, 0.075, 0.13),
-      lowerFace: rangeScore(front.lowerFaceRatio, 0.31, 0.40, 0.55, 0.68)
+      symmetry: clamp(f.symmetry, 0, 1),
+      faceHarmony: rangeScore(f.faceRatio, 0.57, 0.66, 0.79, 0.96),
+      jawBalance: rangeScore(f.jawRatio, 0.47, 0.56, 0.73, 0.86),
+      eyeSpacing: rangeScore(f.eyeSpacingRatio, 0.25, 0.32, 0.43, 0.55),
+      noseProportion: rangeScore(f.noseRatio, 0.12, 0.19, 0.29, 0.40),
+      mouthProportion: rangeScore(f.mouthRatio, 0.22, 0.31, 0.47, 0.62),
+      browBalance: rangeScore(f.browEyeGap / Math.max(0.001, f.faceHeight), 0.015, 0.035, 0.075, 0.13),
+      lowerFace: rangeScore(f.lowerFaceRatio, 0.31, 0.40, 0.55, 0.68)
     };
   }
 
   function profileSupport(left, right) {
     const sides = [left, right].filter(Boolean);
-    if (!sides.length) return { coverage: 0, structure: 0.5, balance: 0.5 };
-
-    const structureScores = sides.map((s) => avg([
-      rangeScore(s.jawRatio, 0.47, 0.56, 0.73, 0.86),
-      rangeScore(s.lowerFaceRatio, 0.31, 0.40, 0.55, 0.68)
-    ]));
-    const structure = avg(structureScores);
-    const balance = sides.length === 2
+    if (!sides.length) return { coverage: 0, profileEvidence: 0.35, consistency: 0.35 };
+    const evidence = median(sides.map((s) => clamp((Math.abs(s.yaw) - 0.15) / 0.25, 0, 1)));
+    const consistency = sides.length === 2
       ? clamp(1 - avg([
         Math.abs(left.jawRatio - right.jawRatio) / 0.18,
-        Math.abs(left.lowerFaceRatio - right.lowerFaceRatio) / 0.18
+        Math.abs(left.lowerFaceRatio - right.lowerFaceRatio) / 0.20,
+        Math.abs(left.noseRatio - right.noseRatio) / 0.14
       ]), 0, 1)
       : 0.5;
-    return { coverage: sides.length === 2 ? 1 : 0.55, structure, balance };
+    return { coverage: sides.length === 2 ? 1 : 0.65, profileEvidence: evidence, consistency };
   }
 
   function measurementStability(frontFrames) {
-    if (frontFrames.length < 3) return 0.35;
+    if (frontFrames.length < 3) return 0.25;
     const keys = ['faceRatio', 'jawRatio', 'eyeSpacingRatio', 'noseRatio', 'mouthRatio', 'symmetry', 'lowerFaceRatio'];
-    const instability = avg(keys.map((key) => {
+    const scores = keys.map((key) => {
       const values = frontFrames.map((f) => f.metrics[key]);
-      const scale = Math.max(0.02, Math.abs(median(values)) * 0.12);
-      return clamp(stdev(values) / scale, 0, 1);
-    }));
-    return clamp(1 - instability, 0, 1);
+      const med = Math.max(0.02, Math.abs(median(values)));
+      const relative = stdev(values) / med;
+      return clamp(1 - relative / 0.10, 0, 1);
+    });
+    return avg(scores);
   }
 
   function appearanceScore(front, left, right, frontFrames, selectedFrames) {
-    if (!front) return { score: 0, components: {}, confidence: 0, normalized: 0, stability: 0 };
-    const f = featureScores(front);
+    if (!front) return { score: 0, components: {}, reliability: 0 };
+    const f = frontFeatureScores(front);
     const p = profileSupport(left, right);
     const components = {
       symmetry: f.symmetry,
@@ -444,46 +543,34 @@
       noseProportion: f.noseProportion,
       mouthProportion: f.mouthProportion,
       browBalance: f.browBalance,
-      lowerFace: f.lowerFace,
-      profileStructure: p.structure,
-      profileBalance: p.balance
+      lowerFace: f.lowerFace
     };
 
-    // Transparent heuristic: no camera-quality term is allowed to add attractiveness points.
-    // Profile rotation itself is never rewarded; only the geometry visible in accepted side views is used.
-    const weights = {
-      symmetry: 0.15,
-      faceHarmony: 0.14,
-      jawBalance: 0.14,
-      eyeSpacing: 0.09,
-      noseProportion: 0.09,
-      mouthProportion: 0.07,
-      browBalance: 0.06,
-      lowerFace: 0.10,
-      profileStructure: 0.08,
-      profileBalance: 0.08
-    };
-    let weighted = 0;
-    let weight = 0;
-    for (const [key, w] of Object.entries(weights)) {
-      weighted += components[key] * w;
-      weight += w;
-    }
+    // Transparent heuristic weights. These are not a scientifically calibrated PSL model.
+    // Image quality and pose quality are deliberately excluded from attractiveness points.
+    const weights = state.profile === 'man'
+      ? { symmetry: 0.15, faceHarmony: 0.14, jawBalance: 0.16, eyeSpacing: 0.09, noseProportion: 0.09, mouthProportion: 0.06, browBalance: 0.06, lowerFace: 0.12 }
+      : state.profile === 'woman'
+        ? { symmetry: 0.15, faceHarmony: 0.15, jawBalance: 0.10, eyeSpacing: 0.12, noseProportion: 0.10, mouthProportion: 0.09, browBalance: 0.08, lowerFace: 0.11 }
+        : { symmetry: 0.15, faceHarmony: 0.14, jawBalance: 0.13, eyeSpacing: 0.10, noseProportion: 0.09, mouthProportion: 0.08, browBalance: 0.07, lowerFace: 0.12 };
+
+    let weighted = 0, weight = 0;
+    for (const [key, w] of Object.entries(weights)) { weighted += components[key] * w; weight += w; }
     const normalized = clamp(weighted / Math.max(0.001, weight), 0, 1);
     const score = Number((normalized * 8).toFixed(1));
 
     const stability = measurementStability(frontFrames);
-    const poseQuality = avg(selectedFrames.map((f) => f.pose));
-    const imageQuality = avg(selectedFrames.map((f) => avg([f.sharp, f.light, f.centered])));
-    const countQuality = clamp(Math.min(frontFrames.length, 18) / 18, 0, 1);
+    const poseQuality = median(selectedFrames.map((x) => x.pose));
+    const imageQuality = median(selectedFrames.map((x) => avg([x.sharp, x.light, x.centered, x.scale])));
     const coverage = p.coverage;
-    const confidence = Math.round(clamp(
-      35 + 22 * stability + 18 * poseQuality + 12 * imageQuality * countQuality + 13 * coverage,
-      35,
+    const countQuality = clamp(frontFrames.length / 10, 0, 1);
+    const reliability = Math.round(clamp(
+      30 + 30 * stability + 18 * poseQuality + 12 * imageQuality * countQuality + 10 * coverage,
+      30,
       96
     ));
 
-    return { score, components, confidence, normalized, stability };
+    return { score, components, reliability, normalized, stability, profileCoverage: coverage, profileConsistency: p.consistency };
   }
 
   function tier(score, profile) {
@@ -511,27 +598,25 @@
   const level = (v, good, mid, bad) => v > 0.67 ? good : v > 0.42 ? mid : bad;
 
   function renderResults(result, front, left, right, selectedFrames) {
-    const { score, components, confidence } = result;
-    const t = tier(score, state.profile);
+    const { score, components, reliability } = result;
     $('#score').textContent = score.toFixed(1);
-    $('#tier').textContent = t;
+    $('#tier').textContent = tier(score, state.profile);
     $('#meter').style.width = `${(score / 8) * 100}%`;
     $('#outProfile').textContent = state.profile.toUpperCase();
     $('#outFrames').textContent = `${selectedFrames.length} stable frames • ${[front, left, right].filter(Boolean).length} angle groups`;
-    $('#confidence').textContent = `${confidence}% analysis confidence`;
-    $('#scoreText').textContent = 'PSL-style heuristic from normalized facial geometry and stable multi-frame measurements. Camera quality affects confidence, not the attractiveness score itself.';
+    $('#confidence').textContent = `${reliability}% analysis reliability`;
+    $('#scoreText').textContent = 'Looksmaxx heuristic estimate from normalized facial geometry. Camera quality, pose and lighting affect reliability rather than adding attractiveness points. This is not a scientifically calibrated attractiveness measurement.';
 
-    const faceShape = front.faceRatio < 0.66 ? 'Long / oval leaning' : front.faceRatio > 0.80 ? 'Wider / rounder leaning' : 'Balanced oval leaning';
     const traits = [
-      ['Face shape', faceShape, 'Width-to-height landmark ratio.'],
-      ['Facial symmetry', level(components.symmetry, 'High landmark balance', 'Generally balanced', 'More asymmetry visible'), 'Multiple left/right landmark pairs are compared.'],
+      ['Face shape', front.faceRatio < 0.66 ? 'Long / oval leaning' : front.faceRatio > 0.80 ? 'Wider / rounder leaning' : 'Balanced oval leaning', 'Width-to-height landmark ratio.'],
+      ['Facial symmetry', level(components.symmetry, 'High landmark balance', 'Generally balanced', 'More asymmetry visible'), 'Multiple mirrored landmark pairs after roll normalization.'],
       ['Jaw balance', level(components.jawBalance, 'Strong lower-face balance', 'Moderate', 'Softer lower-face balance'), 'Front-view jaw width relative to cheek width.'],
       ['Eye spacing', level(components.eyeSpacing, 'Proportionate', 'Moderate', 'Further from reference range'), 'Relative inner-eye spacing.'],
       ['Nose proportion', level(components.noseProportion, 'Balanced', 'Moderate', 'Further from reference range'), 'Normalized nose-length proxy.'],
       ['Mouth proportion', level(components.mouthProportion, 'Balanced', 'Moderate', 'Further from reference range'), 'Mouth width relative to facial width.'],
       ['Brow balance', level(components.browBalance, 'Balanced', 'Moderate', 'Further from reference range'), 'Brow-to-eye spacing proxy.'],
-      ['Lower face', level(components.lowerFace, 'Balanced', 'Moderate', 'Further from reference range'), 'Nose-to-chin relationship in the frontal view.'],
-      ['Profile evidence', left && right ? 'Both side groups captured' : left || right ? 'Partial side evidence' : 'No stable side evidence', 'Side frames are supporting evidence rather than bonus points.']
+      ['Lower face', level(components.lowerFace, 'Balanced', 'Moderate', 'Further from reference range'), 'Nose-to-chin relationship in frontal geometry.'],
+      ['Profile evidence', left && right ? 'Both sides captured' : left || right ? 'Partial side evidence' : 'No stable side evidence', 'Used as supporting evidence and consistency checking; not a rotation bonus.']
     ];
     $('#traitList').innerHTML = traits.map(([a, b, c]) => `<div class="trait"><b>${a}</b><span>${b} — ${c}</span></div>`).join('');
 
@@ -546,12 +631,12 @@
     $('#metricGrid').innerHTML = metrics.map(([n, v, max]) => `<div class="metric"><div class="metric-top"><b>${n}</b><small>${round1(v)}</small></div><div class="bar"><i style="width:${pct((v / max) * 100)}"></i></div></div>`).join('');
 
     const improve = [];
-    if (selectedFrames.length < 8) improve.push(['S', 'Scan quality', 'Rescan with the phone about 50–70 cm away, camera at eye level, with the full face visible.']);
-    if (front.light < 0.64) improve.push(['L', 'Lighting', 'Use broad, even light from in front of you. Shadows can make facial structure look different.']);
+    if (reliability < 70) improve.push(['S', 'Rescan for reliability', 'Keep the phone about 50–70 cm away, at eye level, with your whole face visible and steady.']);
+    if (front.light < 0.64) improve.push(['L', 'Lighting', 'Use broad, even light from in front. Avoid strong side shadows and backlighting.']);
     if (front.sharp < 0.55) improve.push(['F', 'Sharpness', 'Clean the lens, hold steady, and avoid digital zoom.']);
-    if (components.jawBalance < 0.5) improve.push(['J', 'Jaw presentation', 'Neutral neck posture and consistent three-quarter photography will show the lower face more reliably.']);
-    if (components.symmetry < 0.6) improve.push(['A', 'Camera angle', 'Keep the head level. Small roll/yaw changes can exaggerate apparent asymmetry.']);
-    if (!improve.length) improve.push(['R', 'Baseline', 'The scan is internally consistent. Focus on grooming, hairstyle, skin care, sleep, posture and presentation rather than tiny score changes.']);
+    if (front.jawRatio < 0.56) improve.push(['J', 'Jaw presentation', 'Keep the neck neutral and use consistent three-quarter photography when checking the lower face.']);
+    if (components.symmetry < 0.60) improve.push(['A', 'Camera alignment', 'Keep the head level and centered. Perspective and head roll can exaggerate apparent asymmetry.']);
+    if (!improve.length) improve.push(['R', 'Baseline', 'The scan is internally consistent. Focus on grooming, hairstyle, skin care, sleep, posture and presentation rather than chasing tiny score changes.']);
     $('#improvementList').innerHTML = improve.map(([a, b, c]) => `<div class="improvement"><span>${a}</span><div><b>${b}</b><p>${c}</p></div></div>`).join('');
     $('#resultsSection')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -559,21 +644,17 @@
   function finishAnalysis() {
     stopCamera(false);
 
-    const frontFrames = selectBest(state.frames.filter((f) => f.phase === 'front'), 8);
-    const sideFrames = selectBest(state.frames.filter((f) => f.phase === 'left' || f.phase === 'right'), 16);
-
-    // Classify the two side groups from actual detected yaw sign. This avoids a mirrored/selfie UI reversing left/right.
-    const sideA = sideFrames.filter((f) => f.sideSign > 0).slice(0, 8);
-    const sideB = sideFrames.filter((f) => f.sideSign < 0).slice(0, 8);
-
+    const frontFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'front'), 8);
+    const leftFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'left'), 6);
+    const rightFrames = chooseDiverse(state.frames.filter((f) => f.phase === 'right'), 6);
     const front = aggregateRobust(frontFrames);
-    const left = aggregateRobust(sideA);
-    const right = aggregateRobust(sideB);
-    const selectedFrames = [...frontFrames, ...sideA, ...sideB];
+    const left = aggregateRobust(leftFrames);
+    const right = aggregateRobust(rightFrames);
+    const selectedFrames = [...frontFrames, ...leftFrames, ...rightFrames];
 
-    if (!front || frontFrames.length < 3) {
-      $('#cameraStatus').textContent = 'Not enough stable frontal frames were captured. Keep your face centered and rescan.';
-      toast('Not enough stable frontal frames.');
+    if (!front || frontFrames.length < PHASES.front.minFrames) {
+      $('#cameraStatus').textContent = 'Not enough stable frontal frames were captured. Rescan with your face centered and head level.';
+      toast('Not enough stable front frames.');
       state.analyzing = false;
       $('#cameraBtn').disabled = false;
       return;
@@ -584,14 +665,13 @@
       score: result.score,
       tier: tier(result.score, state.profile),
       profile: state.profile,
-      confidence: result.confidence,
+      reliability: result.reliability,
       frames: selectedFrames.length,
       timestamp: new Date().toISOString(),
       front,
       left,
       right
     };
-
     renderResults(result, front, left, right, selectedFrames);
     loadHistory();
     state.analyzing = false;
@@ -599,7 +679,8 @@
 
   function resultForHistory(item) {
     const date = new Date(item.timestamp);
-    return `<div class="history-item"><div><b>${item.profile.toUpperCase()} • ${item.tier}</b><span>${date.toLocaleString()} • ${item.frames} stable frames • ${item.confidence}% confidence</span></div><strong>${Number(item.score).toFixed(1)}</strong></div>`;
+    const reliability = Number(item.reliability ?? item.confidence ?? 0);
+    return `<div class="history-item"><div><b>${String(item.profile || '').toUpperCase()} • ${item.tier || '—'}</b><span>${date.toLocaleString()} • ${item.frames || 0} stable frames • ${reliability}% reliability</span></div><strong>${Number(item.score).toFixed(1)}</strong></div>`;
   }
 
   function saveResult() {
@@ -607,16 +688,19 @@
       toast('Complete a scan first.');
       return;
     }
-    const key = 'looksmaxx-history';
-    const history = JSON.parse(localStorage.getItem(key) || '[]');
-    history.unshift(state.lastResult);
-    localStorage.setItem(key, JSON.stringify(history.slice(0, 15)));
-    loadHistory();
-    toast('Result saved locally.');
+    try {
+      const history = safeHistoryRead();
+      history.unshift(state.lastResult);
+      localStorage.setItem('looksmaxx-history', JSON.stringify(history.slice(0, 15)));
+      loadHistory();
+      toast('Result saved locally.');
+    } catch {
+      toast('Could not save this result on this device.');
+    }
   }
 
   function loadHistory() {
-    const history = JSON.parse(localStorage.getItem('looksmaxx-history') || '[]');
+    const history = safeHistoryRead();
     const html = history.length ? history.map(resultForHistory).join('') : '<div class="empty">No saved results yet.</div>';
     $('#historyList').innerHTML = html;
     $('#historyModalBody').innerHTML = html;
